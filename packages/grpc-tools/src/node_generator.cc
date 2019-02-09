@@ -17,11 +17,14 @@
  */
 
 #include <map>
+#include <string>
+#include <queue>
 
 #include "config.h"
 #include "generator_helpers.h"
 #include "node_generator.h"
 #include "node_generator_helpers.h"
+#include <google/protobuf/stubs/strutil.h>
 
 using grpc::protobuf::Descriptor;
 using grpc::protobuf::FileDescriptor;
@@ -53,39 +56,91 @@ grpc::string ModuleAlias(const grpc::string filename) {
 }
 
 // Given a filename like foo/bar/baz.proto, returns the corresponding JavaScript
-// message file foo/bar/baz.js
+// message file baz_pb.js
 grpc::string GetJSMessageFilename(const grpc::string& filename) {
-  grpc::string name = filename;
+  std::vector<grpc::string> file_split = google::protobuf::Split(filename, "/");
+  grpc::string name = file_split.back();
   return grpc_generator::StripProto(name) + "_pb.js";
 }
 
-// Given a filename like foo/bar/baz.proto, returns the root directory
-// path ../../
-grpc::string GetRootPath(const grpc::string& from_filename,
-                         const grpc::string& to_filename) {
-  if (to_filename.find("google/protobuf") == 0) {
-    // Well-known types (.proto files in the google/protobuf directory) are
-    // assumed to come from the 'google-protobuf' npm package.  We may want to
-    // generalize this exception later by letting others put generated code in
-    // their own npm packages.
-    return "google-protobuf/";
+// Given a filename like foo/bar/baz.proto, returns the relative directory to the import file
+// or an npm module import
+grpc::string GetRelativePath(const grpc::string& from_filename, const grpc::string& to_filename) {
+  std::vector<grpc::string> source_file_split = google::protobuf::Split(from_filename, "/");
+  std::vector<grpc::string> import_file_split = google::protobuf::Split(to_filename, "/");
+
+  // remove filenames
+  source_file_split.pop_back();
+  import_file_split.pop_back();
+
+  size_t source_path_length = source_file_split.size();
+
+  size_t equal_parts_counter = 0;
+  bool continue_running = true;
+
+  while(continue_running) {
+    if(source_file_split.empty() || import_file_split.empty()) {
+        continue_running = false;
+    } else {
+      grpc::string& current_path_part = source_file_split.front();
+      grpc::string& current_path_part_import = import_file_split.front();
+
+      // one of the vectors became empty
+      if(current_path_part == current_path_part_import){
+        equal_parts_counter++;
+        // Delete the first entry so we can continue searching for similarities in the rest of the path
+        source_file_split.erase(source_file_split.begin());
+        import_file_split.erase(import_file_split.begin());
+      // stop once a part of the path doesn't match between source and import
+      } else {
+        continue_running = false;
+      }
+    }
   }
-  size_t slashes = std::count(from_filename.begin(), from_filename.end(), '/');
-  if (slashes == 0) {
+  
+  if(source_path_length == equal_parts_counter && import_file_split.size() != 0) {
+    // import from subdirectory
+    // e.g. source -> /foo/baz.proto
+    //      import -> /foo/bar/baz2.proto
+    // expected return -> ./bar/
+    import_file_split.insert(import_file_split.begin(), ".");
+    return google::protobuf::JoinStrings(import_file_split, "/") +  "/";
+  } else if(source_path_length == equal_parts_counter) {
+    // Same directory import
     return "./";
+  } else if (equal_parts_counter == 0) {
+    // completely different package. Expect this to be npm package
+    // e.g. google/protobuf
+    return google::protobuf::JoinStrings(import_file_split, "/") +  "/";
+  } else if (source_file_split.size() > import_file_split.size()) {
+    // Import from higher directory
+    // e.g. source /foo/bar/baz/baz.proto
+    //      import /foo/bar.proto
+    // expected return -> ../../
+    std::vector<grpc::string> mapped_vector;
+    mapped_vector.resize(source_file_split.size());
+    // transform remaining path length to ../ 
+    std::transform(source_file_split.begin(), source_file_split.end(), mapped_vector.begin(), [](grpc::string d) -> grpc::string { return "../"; });
+    return google::protobuf::JoinStrings(mapped_vector, "");
+  } else {
+    // import from different subdirectory
+    // e.g. source /foo/bar/baz/hoge.proto
+    //      import /foo/bar/hoge/baz.proto
+    // expected return -> ../hoge/
+    std::vector<grpc::string> mapped_vector;
+    mapped_vector.resize(source_file_split.size());
+    // transform remaining path length to ../ 
+    std::transform(source_file_split.begin(), source_file_split.end(), mapped_vector.begin(), [](grpc::string d) -> grpc::string { return "../"; });
+
+    return google::protobuf::JoinStrings(mapped_vector, "") + google::protobuf::JoinStrings(import_file_split, "/") + "/";
   }
-  grpc::string result = "";
-  for (size_t i = 0; i < slashes; i++) {
-    result += "../";
-  }
-  return result;
 }
 
 // Return the relative path to load to_file from the directory containing
 // from_file, assuming that both paths are relative to the same directory
-grpc::string GetRelativePath(const grpc::string& from_file,
+grpc::string GetRelativeImportPath(const grpc::string& from_file,
                              const grpc::string& to_file) {
-  return GetRootPath(from_file, to_file) + to_file;
+  return GetRelativePath(from_file, to_file) + to_file;
 }
 
 /* Finds all message types used in all services in the file, and returns them
@@ -206,13 +261,13 @@ void PrintImports(const FileDescriptor* file, Printer* out) {
   out->Print("var grpc = require('grpc');\n");
   if (file->message_type_count() > 0) {
     grpc::string file_path =
-        GetRelativePath(file->name(), GetJSMessageFilename(file->name()));
+        GetRelativeImportPath(file->name(), GetJSMessageFilename(file->name()));
     out->Print("var $module_alias$ = require('$file_path$');\n", "module_alias",
                ModuleAlias(file->name()), "file_path", file_path);
   }
 
   for (int i = 0; i < file->dependency_count(); i++) {
-    grpc::string file_path = GetRelativePath(
+    grpc::string file_path = GetRelativeImportPath(
         file->name(), GetJSMessageFilename(file->dependency(i)->name()));
     out->Print("var $module_alias$ = require('$file_path$');\n", "module_alias",
                ModuleAlias(file->dependency(i)->name()), "file_path",
